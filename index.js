@@ -1,111 +1,165 @@
 const fs = require("fs");
+const path = require("path");
+
 const { Client, MessageMedia, LocalAuth } = require("whatsapp-web.js");
 const qrcode = require("qrcode-terminal");
 const commander = require("commander");
 const axios = require("axios");
 const urlRegex = require("url-regex");
 
-// comandos
-const STICKER_COMMANDS = new Set(["/sticker", "/s"]);
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegStatic = require("ffmpeg-static");
 
-const MediaType = {
-  Image: { contentType: "image/jpeg", fileName: "image.jpg" },
-  Video: { contentType: "video/mp4", fileName: "video.mp4" },
-};
+// ====== CONFIG ======
+const STICKER_COMMANDS = new Set(["/s", "/sticker"]);
+const FPS = 30;
 
-// CLI (igual ao projeto do link)
+// Duração máxima que vamos tentar (WhatsApp costuma limitar sticker animado; 10s é um bom teto)
+const DURATIONS = [10, 8, 6, 5, 4, 3];
+
+// Alvo de tamanho (não é “lei”, mas ajuda a não falhar). Pode aumentar se quiser.
+const TARGET_MAX_BYTES = 1500 * 1024; // 1.5MB
+// ====================
+
+// CLI opcional
 commander
-  .usage("[OPTIONS]...")
   .option("-d, --debug", "Show debug logs", false)
-  .option("-c, --chrome <value>", "Use an installed Chrome/Chromium binary path")
-  .option("-f, --ffmpeg <value>", "Use a different ffmpeg path")
+  .option("-c, --chrome <value>", "Chrome/Chromium binary path")
+  .option("-f, --ffmpeg <value>", "FFmpeg path")
   .parse(process.argv);
 
 const options = commander.opts();
 const logDebug = options.debug ? console.log : () => {};
 
+function ensureTmp() {
+  const dir = path.join(__dirname, "tmp");
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir);
+  return dir;
+}
+
 function detectChromiumPath() {
-  // Se o usuário passou --chrome, usa ele.
   if (options.chrome) return options.chrome;
 
-  // Detecção comum no Ubuntu
-  const candidates = ["/usr/bin/chromium-browser", "/usr/bin/chromium", "/snap/bin/chromium"];
+  const candidates = [
+    "/usr/bin/chromium-browser",
+    "/usr/bin/chromium",
+    "/snap/bin/chromium",
+  ];
   for (const p of candidates) {
     try {
       if (fs.existsSync(p)) return p;
     } catch {}
   }
-  // fallback: deixa undefined (puppeteer tenta baixar/usar padrão)
-  return undefined;
+  return undefined; // Windows local geralmente não precisa
 }
 
-const puppeteerConfig = {
-  executablePath: detectChromiumPath(),
-  args: ["--no-sandbox", "--disable-setuid-sandbox"],
-};
+function detectFfmpegPath() {
+  if (options.ffmpeg) return options.ffmpeg;
+  if (process.env.FFMPEG_PATH) return process.env.FFMPEG_PATH;
+  // ffmpeg-static (Windows/local) normalmente funciona
+  return ffmpegStatic || undefined;
+}
 
-const ffmpegPath = options.ffmpeg ? options.ffmpeg : undefined;
+ffmpeg.setFfmpegPath(detectFfmpegPath());
 
-// Client
 const client = new Client({
   authStrategy: new LocalAuth({ clientId: "wpp-sticker" }),
-  puppeteer: puppeteerConfig,
-  ffmpegPath,
-  // Mesma ideia do repo: fixar uma versão do WhatsApp Web via cache remoto
+  puppeteer: {
+    executablePath: detectChromiumPath(),
+    args: ["--no-sandbox", "--disable-setuid-sandbox"],
+  },
+  // ajuda conversões internas, mas nós vamos converter vídeo manualmente
+  ffmpegPath: detectFfmpegPath(),
   webVersionCache: {
     type: "remote",
-    remotePath: "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
+    remotePath:
+      "https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html",
   },
 });
 
-async function sendMediaSticker(sender, type, base64Data) {
-  const media = new MessageMedia(type.contentType, base64Data, type.fileName);
+async function sendStickerWebp(sender, webpBuffer) {
+  const media = new MessageMedia(
+    "image/webp",
+    webpBuffer.toString("base64"),
+    "sticker.webp"
+  );
   await client.sendMessage(sender, media, { sendMediaAsSticker: true });
 }
 
-async function generateSticker(msg, sender) {
-  // IMAGEM/VÍDEO enviados
-  if (msg.type === "image") {
-    const { data } = await msg.downloadMedia();
-    await sendMediaSticker(sender, MediaType.Image, data);
-    return;
-  }
+async function sendImageAsSticker(sender, base64Data) {
+  const media = new MessageMedia("image/jpeg", base64Data, "image.jpg");
+  await client.sendMessage(sender, media, { sendMediaAsSticker: true });
+}
 
-  if (msg.type === "video") {
-    const { data } = await msg.downloadMedia();
-    await sendMediaSticker(sender, MediaType.Video, data);
-    return;
-  }
+async function videoBase64ToAnimatedWebp(videoBase64) {
+  const tmp = ensureTmp();
+  const inPath = path.join(tmp, `in_${Date.now()}.mp4`);
+  const outPath = path.join(tmp, `out_${Date.now()}.webp`);
 
-  // TEXTO com link
-  if (msg.type === "chat") {
-    const url = msg.body
-      .split(/\s+/)
-      .find((t) => urlRegex({ strict: false }).test(t));
+  fs.writeFileSync(inPath, Buffer.from(videoBase64, "base64"));
 
-    if (!url) {
-      await msg.reply("❌ Erro, URL inválida!");
-      return;
+  let best = null;
+
+  try {
+    for (const duration of DURATIONS) {
+      // qualidade menor = arquivo menor (em webp com ffmpeg, q:v maior => mais compressão)
+      let qv = 50; // comece aqui
+      for (let attempt = 0; attempt < 4; attempt++) {
+        await new Promise((resolve, reject) => {
+          ffmpeg(inPath)
+            .outputOptions([
+              "-vcodec",
+              "libwebp",
+              "-vf",
+              `scale=512:512:force_original_aspect_ratio=decrease,fps=${FPS},pad=512:512:-1:-1:color=0x00000000`,
+              "-loop",
+              "0",
+              "-preset",
+              "picture",
+              "-an",
+              "-vsync",
+              "0",
+              "-t",
+              String(duration),
+              "-compression_level",
+              "6",
+              "-q:v",
+              String(qv),
+            ])
+            .toFormat("webp")
+            .save(outPath)
+            .on("end", resolve)
+            .on("error", reject);
+        });
+
+        const buf = fs.readFileSync(outPath);
+        best = buf;
+
+        if (buf.length <= TARGET_MAX_BYTES) return buf;
+
+        qv += 10; // mais compressão
+      }
     }
 
-    logDebug("URL:", url);
-
-    let { data, headers } = await axios.get(url, { responseType: "arraybuffer" });
-    const contentType = headers["content-type"] || "";
-    const base64 = Buffer.from(data).toString("base64");
-
-    if (contentType.includes("image")) {
-      await sendMediaSticker(sender, MediaType.Image, base64);
-      return;
-    }
-
-    if (contentType.includes("video") || contentType.includes("gif")) {
-      await sendMediaSticker(sender, MediaType.Video, base64);
-      return;
-    }
-
-    await msg.reply("❌ Erro, URL inválida!");
+    // se não conseguiu caber no alvo, devolve a melhor tentativa mesmo
+    if (!best) throw new Error("Falha ao gerar WEBP animado.");
+    return best;
+  } finally {
+    try {
+      if (fs.existsSync(inPath)) fs.unlinkSync(inPath);
+      if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
+    } catch {}
   }
+}
+
+async function getTargetMessage(msg) {
+  // Se o /s foi enviado respondendo uma mídia, usamos a mensagem citada
+  const quoted = await msg.getQuotedMessage().catch(() => null);
+  return quoted || msg;
+}
+
+function getFirstToken(text) {
+  return (text || "").trim().split(/\s+/)[0].toLowerCase();
 }
 
 client.on("qr", (qr) => {
@@ -113,25 +167,86 @@ client.on("qr", (qr) => {
   qrcode.generate(qr, { small: true });
 });
 
-client.on("ready", () => {
-  console.log("✅ Wpp-Sticker is ready!");
-});
+client.on("ready", () => console.log("✅ Bot conectado!"));
 
 client.on("message_create", async (msg) => {
-  const first = (msg.body || "").trim().split(/\s+/)[0].toLowerCase();
-  if (!STICKER_COMMANDS.has(first)) return;
-
-  logDebug("User:", client.info.wid.user, "To:", msg.to, "From:", msg.from);
-
-  // Mesmo truque do repo: se a msg veio do próprio número logado, responde no "to"
-  const sender = msg.from.startsWith(client.info.wid.user) ? msg.to : msg.from;
-
   try {
-    await generateSticker(msg, sender);
+    const body = msg.body || "";
+    const first = getFirstToken(body);
+
+    // 1) comando no texto (/s ou /sticker)
+    const isCommandText = STICKER_COMMANDS.has(first);
+
+    // 2) comando na legenda da mídia (foto/vídeo com caption "/s")
+    const caption = (msg._data?.caption || "").trim().toLowerCase();
+    const isCommandCaption = STICKER_COMMANDS.has(getFirstToken(caption));
+
+    if (!isCommandText && !isCommandCaption) return;
+
+    // mesmo truque: se a mensagem veio do próprio número logado, responde no "to"
+    const sender = msg.from.startsWith(client.info.wid.user) ? msg.to : msg.from;
+
+    const target = isCommandText ? await getTargetMessage(msg) : msg;
+
+    // Se o target tem mídia, baixa e processa
+    if (target.hasMedia) {
+      const media = await target.downloadMedia();
+      if (!media) {
+        await msg.reply("❌ Não consegui baixar a mídia.");
+        return;
+      }
+
+      const mime = media.mimetype || "";
+
+      // IMAGEM
+      if (mime.startsWith("image/") && mime !== "image/webp") {
+        await sendImageAsSticker(sender, media.data);
+        return;
+      }
+
+      // VÍDEO/GIF -> converte para WEBP animado e envia
+      if (mime.startsWith("video/") || mime === "image/gif") {
+        const webpBuf = await videoBase64ToAnimatedWebp(media.data);
+        await sendStickerWebp(sender, webpBuf);
+        return;
+      }
+
+      await msg.reply("❌ Tipo de mídia não suportado. Envie imagem, vídeo ou GIF.");
+      return;
+    }
+
+    // Se não tem mídia, tenta URL no texto (apenas para /s no texto)
+    const url = body
+      .split(/\s+/)
+      .find((t) => urlRegex({ strict: false }).test(t));
+
+    if (!url) {
+      await msg.reply("❌ Use /s na legenda da mídia OU responda a mídia com /s. (Ou mande /s <url>)");
+      return;
+    }
+
+    const res = await axios.get(url, { responseType: "arraybuffer" });
+    const contentType = (res.headers["content-type"] || "").toLowerCase();
+    const base64 = Buffer.from(res.data).toString("base64");
+
+    if (contentType.includes("image")) {
+      await sendImageAsSticker(sender, base64);
+      return;
+    }
+
+    if (contentType.includes("video") || contentType.includes("gif")) {
+      const webpBuf = await videoBase64ToAnimatedWebp(base64);
+      await sendStickerWebp(sender, webpBuf);
+      return;
+    }
+
+    await msg.reply("❌ Erro, URL inválida!");
   } catch (e) {
-    console.log(e);
-    await msg.reply("❌ Erro ao gerar Sticker!");
+    console.error(e);
+    try {
+      await msg.reply("❌ Erro ao gerar Sticker!");
+    } catch {}
   }
 });
 
-client.initialize(); 
+client.initialize();
